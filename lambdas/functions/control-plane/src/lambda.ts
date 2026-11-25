@@ -17,7 +17,7 @@ export async function scaleUpHandler(event: SQSEvent, context: Context): Promise
   const sqsMessages: ActionRequestMessageSQS[] = [];
   const warnedEventSources = new Set<string>();
 
-  for (const { body, eventSource, messageId } of event.Records) {
+  for (const { body, eventSource, messageId, attributes } of event.Records) {
     if (eventSource !== 'aws:sqs') {
       if (!warnedEventSources.has(eventSource)) {
         logger.warn('Ignoring non-sqs event source', { eventSource });
@@ -28,7 +28,8 @@ export async function scaleUpHandler(event: SQSEvent, context: Context): Promise
     }
 
     const payload = JSON.parse(body) as ActionRequestMessage;
-    sqsMessages.push({ ...payload, messageId });
+    const receiveCount = Number.parseInt(attributes?.ApproximateReceiveCount ?? '', 10) || 1;
+    sqsMessages.push({ ...payload, messageId, receiveCount });
   }
 
   // Sort messages by their retry count, so that we retry the same messages if

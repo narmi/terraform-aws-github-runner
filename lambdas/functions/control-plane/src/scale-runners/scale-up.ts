@@ -1,4 +1,6 @@
+import { RequestError } from '@octokit/request-error';
 import { Octokit } from '@octokit/rest';
+import { setTimeout as delay } from 'node:timers/promises';
 import {
   addPersistentContextToChildLogger,
   createChildLogger,
@@ -12,6 +14,7 @@ import { createRunner, listEC2Runners, tag, terminateRunner } from './../aws/run
 import { Ec2OverrideConfig, RunnerInputParameters } from './../aws/runners.d';
 import { metricGitHubAppRateLimit } from '../github/rate-limit';
 import { publishRetryMessage } from './job-retry';
+import ScaleError from './ScaleError';
 import {
   _InstanceType,
   Tenancy,
@@ -50,6 +53,8 @@ const logger = createChildLogger('scale-up');
 const RUNNER_LABELS_TAG_KEY = 'ghr:runner_labels';
 const RUNNER_LABELS_TAG_VALUE_SEPARATOR = ',';
 const EC2_OVERRIDE_LIST_VALUE_SEPARATOR = ';';
+const JOB_LOOKUP_RETRY_DELAY_MS = 500;
+const MAX_JOB_LOOKUP_DELIVERIES = 3;
 export const EC2_TAG_VALUE_MAX_LENGTH = 256;
 export const RUNNER_LABELS_TAG_MAX_COUNT = 5;
 
@@ -79,6 +84,7 @@ export interface ActionRequestMessage {
 
 export interface ActionRequestMessageSQS extends ActionRequestMessage {
   messageId: string;
+  receiveCount?: number;
 }
 
 export interface ActionRequestMessageRetry extends ActionRequestMessage {
@@ -240,6 +246,25 @@ export async function isJobQueued(githubInstallationClient: Octokit, payload: Ac
     throw Error(`Event ${payload.eventType} is not supported`);
   }
   return isQueued;
+}
+
+async function isJobQueuedWithRetry(githubInstallationClient: Octokit, message: ActionRequestMessage) {
+  const lookup = () =>
+    isJobQueued(githubInstallationClient, message).catch((error: unknown) => {
+      if (error instanceof RequestError && error.status === 404) {
+        return undefined;
+      }
+      throw error;
+    });
+
+  const queued = await lookup();
+  if (queued !== undefined) {
+    return queued;
+  }
+
+  // A queued webhook can arrive before the job is visible to the GitHub API.
+  await delay(JOB_LOOKUP_RETRY_DELAY_MS);
+  return lookup();
 }
 
 async function getRunnerGroupId(githubRunnerConfig: CreateGitHubRunnerConfig, ghClient: Octokit): Promise<number> {
@@ -536,7 +561,7 @@ export async function scaleUp(payloads: ActionRequestMessageSQS[]): Promise<stri
       }
     }
 
-    for (const message of messages) {
+    for (const { receiveCount = 1, ...message } of messages) {
       const messageLogger = logger.createChild({
         persistentKeys: {
           eventType: message.eventType,
@@ -547,7 +572,24 @@ export async function scaleUp(payloads: ActionRequestMessageSQS[]): Promise<stri
         },
       });
 
-      if (enableJobQueuedCheck && !(await isJobQueued(githubInstallationClient, message))) {
+      const queued = enableJobQueuedCheck ? await isJobQueuedWithRetry(githubInstallationClient, message) : true;
+      if (queued === undefined) {
+        if (receiveCount < MAX_JOB_LOOKUP_DELIVERIES) {
+          messageLogger.warn('GitHub job not found. A retry will be attempted via SQS.', {
+            jobId: message.id,
+            receiveCount,
+          });
+          rejectedMessageIds.add(message.messageId);
+        } else {
+          messageLogger.warn('GitHub job not found at the delivery limit. No runner will be created.', {
+            jobId: message.id,
+            receiveCount,
+          });
+        }
+        continue;
+      }
+
+      if (!queued) {
         messageLogger.info('No runner will be created, job is not queued.');
 
         continue;
@@ -592,7 +634,7 @@ export async function scaleUp(payloads: ActionRequestMessageSQS[]): Promise<stri
       if (ephemeralEnabled) {
         // This removes `missingInstanceCount` items from the start of the array
         // so that, if we retry more messages later, we pick fresh ones.
-        const removedMessages = messages.splice(0, missingInstanceCount);
+        const removedMessages = queuedMessages.splice(0, missingInstanceCount);
         removedMessages.forEach(({ messageId }) => rejectedMessageIds.add(messageId));
       }
 
@@ -648,7 +690,20 @@ export async function scaleUp(payloads: ActionRequestMessageSQS[]): Promise<stri
       newRunners,
       githubInstallationClient,
       'scale-up-lambda',
-    );
+    ).catch((error: unknown) => {
+      if (!(error instanceof ScaleError)) {
+        throw error;
+      }
+      for (const { itemIdentifier } of error.toBatchItemFailures(queuedMessages)) {
+        rejectedMessageIds.add(itemIdentifier);
+      }
+      logger.warn(`${error.detailedMessage} A retry will be attempted via SQS.`, { error });
+      return undefined;
+    });
+
+    if (instances === undefined) {
+      continue;
+    }
 
     // Not all runners we wanted were created, let's reject enough items so that
     // number of entries will be retried.
@@ -661,7 +716,7 @@ export async function scaleUp(payloads: ActionRequestMessageSQS[]): Promise<stri
         failedInstanceCount,
       });
 
-      const failedMessages = messages.slice(0, failedInstanceCount);
+      const failedMessages = queuedMessages.slice(0, failedInstanceCount);
       failedMessages.forEach(({ messageId }) => rejectedMessageIds.add(messageId));
     }
 
